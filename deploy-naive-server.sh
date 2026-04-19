@@ -31,25 +31,24 @@
 #   ENABLE_WARP=1  route outbound via Cloudflare WARP (wgcf + kernel WireGuard
 #                  + policy routing). Hides VPS IP for outbound while keeping
 #                  inbound :443/:80 on the VPS IP. Asked interactively if unset.
-#   NODE_ROLE    standalone|entry|exit (default: standalone). In a two-node
-#                chain the client connects to the "entry" node, which transparently
-#                forwards CONNECT to the "exit" node via HTTPS upstream. The
-#                "exit" role is behaviorally identical to "standalone" — the
-#                label just marks the node in the summary output. Asked interactively.
-#   UPSTREAM_DOMAIN / UPSTREAM_USER / UPSTREAM_PASS
-#                required when NODE_ROLE=entry — they identify the exit node
-#                and are taken from /root/naive-credentials.txt on that node.
+#   NODE_ROLE    standalone (default) | forwarder. Asked interactively.
+#                - standalone: full naive server (Caddy + TLS + optional WARP).
+#                - forwarder:  transparent L4 iptables relay to another VPS
+#                              running standalone. No Caddy, no domain, no cert.
+#                              Client TLS goes directly to the origin; the
+#                              forwarder just DNAT/SNAT's packets at kernel level.
+#   ORIGIN_IP    required when NODE_ROLE=forwarder — the public IP of the
+#                naive (standalone) server this forwarder will relay to.
 #   NONINTERACTIVE=1  never prompt, fail if something required is missing
 
 set -euo pipefail
 
-# When the script is executed via a pipe (`curl ... | bash` or `bash <(curl ...)`
-# in some shells), stdin is not the terminal and `read -rp` would hang or
-# consume the piped script. Reopen stdin from /dev/tty so interactive prompts
-# still work. If there's no tty at all (cron, docker without -it) we leave
-# stdin alone — the script will then run in non-interactive mode and require
-# env vars for everything required.
-if [[ ! -t 0 && -r /dev/tty ]]; then
+# When the script is executed via a pipe (`curl ... | bash` or `bash <(curl ...)`),
+# stdin is not the terminal and `read -rp` would hang or consume the piped
+# script. If stdout IS a TTY we have a controlling terminal we can reopen
+# stdin from; in no-TTY environments (cron, docker without -it) we leave
+# stdin alone and the script runs non-interactive (requires env vars).
+if [[ -t 1 && ! -t 0 && -r /dev/tty ]]; then
   exec </dev/tty
 fi
 
@@ -126,9 +125,160 @@ case "${ID:-}:${VERSION_ID:-}" in
   *) warn "untested OS ${ID} ${VERSION_ID}; continuing anyway" ;;
 esac
 
-printf '\n\033[1;34m=== NaiveProxy server setup ===\033[0m\n'
+printf '\n\033[1;34m=== NaiveProxy node setup ===\033[0m\n'
+
+# --- Node role (asked early — forwarder skips almost everything else)
+NODE_ROLE="${NODE_ROLE:-}"
+case "$NODE_ROLE" in
+  entry|exit)
+    die "NODE_ROLE=$NODE_ROLE was removed. Use:
+    - NODE_ROLE=forwarder ORIGIN_IP=... for a cheap L4 relay in front of a naive server
+    - NODE_ROLE=standalone                for the backend naive server itself
+  See README for the updated 2-node recipe." ;;
+  standalone|forwarder) ;;
+  "")
+    if [[ "${NONINTERACTIVE:-0}" != "1" && -t 0 ]]; then
+      printf '  1) standalone — full naive server (Caddy + TLS + optional WARP)\n'
+      printf '  2) forwarder  — L4 iptables relay in front of a standalone node\n'
+      printf '                  (no Caddy, no cert — just kernel packet forwarding)\n'
+      role_reply=""
+      read -rp "$(printf '\033[1;36m?\033[0m Choose role [1]: ')" role_reply
+      case "${role_reply:-1}" in
+        2|forwarder|relay) NODE_ROLE=forwarder ;;
+        *)                 NODE_ROLE=standalone ;;
+      esac
+    else
+      NODE_ROLE=standalone
+    fi
+    ;;
+  *) die "NODE_ROLE must be one of: standalone, forwarder (got: $NODE_ROLE)" ;;
+esac
+
+ARCH_RAW=$(uname -m)
+case "$ARCH_RAW" in
+  x86_64)  GOARCH=amd64 ;;
+  aarch64) GOARCH=arm64 ;;
+  armv7l)  GOARCH=armv6l ;;
+  *) die "unsupported arch: $ARCH_RAW" ;;
+esac
+
+# ============================================================================
+# FORWARDER role — L4 iptables DNAT+SNAT to an origin naive server.
+# Everything below this block is for standalone. Forwarder exits cleanly here.
+# ============================================================================
+
+if [[ "$NODE_ROLE" == "forwarder" ]]; then
+  ask ORIGIN_IP "Origin IP (the standalone naive server this will relay to)" "" '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+
+  log "deploying as L4 forwarder → ${ORIGIN_IP}"
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --no-install-recommends ufw iptables curl
+
+  # Perf + forwarding sysctls. accept_local / route_localnet let locally-bound
+  # sockets also participate in NAT paths; ip_forward is mandatory for DNAT.
+  cat > /etc/sysctl.d/99-naive-forwarder.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.accept_local = 1
+net.ipv4.conf.all.route_localnet = 1
+net.netfilter.nf_conntrack_max = 2000000
+net.ipv4.tcp_mtu_probing = 1
+net.core.netdev_max_backlog = 250000
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+EOF
+  sysctl -q --system
+
+  LOCAL_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  [[ -n "$LOCAL_IP" ]] || die "cannot determine local IPv4"
+
+  # UFW: open SSH first (don't lock ourselves out), then enable.
+  ufw allow OpenSSH >/dev/null 2>&1 || true
+  if ! LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw --force enable >/dev/null 2>&1
+  fi
+
+  # Flip default forward policy to ACCEPT so ufw doesn't drop forwarded packets.
+  sed -i 's/DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+
+  # Backup once, then rewrite NAT + mangle + FORWARD blocks idempotently.
+  [[ -f /etc/ufw/before.rules.naive-orig ]] || cp /etc/ufw/before.rules /etc/ufw/before.rules.naive-orig
+
+  # Strip any previous *nat and *mangle blocks we (or earlier runs) added.
+  sed -i '/^\*nat/,/^COMMIT$/d'    /etc/ufw/before.rules
+  sed -i '/^\*mangle/,/^COMMIT$/d' /etc/ufw/before.rules
+
+  # Build new rules and prepend. Ports: 80/443 TCP (HTTP+h2+ACME), 443 UDP (h3/QUIC).
+  RULES_FILE=/root/.naive-forwarder-rules
+  cat > "$RULES_FILE" <<EOF
+*nat
+:PREROUTING ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# DNAT: incoming 80/tcp, 443/tcp, 443/udp → origin
+-A PREROUTING -p tcp -m multiport --dports 80,443 -j DNAT --to-destination ${ORIGIN_IP}
+-A PREROUTING -p udp --dport 443                   -j DNAT --to-destination ${ORIGIN_IP}
+# SNAT: rewrite source so return packets come back here
+-A POSTROUTING -p tcp -d ${ORIGIN_IP} -j SNAT --to-source ${LOCAL_IP}
+-A POSTROUTING -p udp -d ${ORIGIN_IP} -j SNAT --to-source ${LOCAL_IP}
+COMMIT
+
+*mangle
+:FORWARD ACCEPT [0:0]
+# Clamp TCP MSS to path MTU — fixes black-holed connections when the origin
+# side is using WireGuard (WARP) with a smaller MTU than this link.
+-A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+COMMIT
+
+EOF
+  cat "$RULES_FILE" /etc/ufw/before.rules > /etc/ufw/before.rules.new
+  mv /etc/ufw/before.rules.new /etc/ufw/before.rules
+  rm -f "$RULES_FILE"
+
+  # Open the forwarded ports.
+  ufw allow 80/tcp  >/dev/null
+  ufw allow 443/tcp >/dev/null
+  ufw allow 443/udp >/dev/null
+  ufw reload >/dev/null
+
+  cat <<EOF
+
+============================================================
+ NaiveProxy forwarder ready
+============================================================
+ Role        : forwarder (L4 iptables DNAT → ${ORIGIN_IP})
+ Forwarder IP: ${LOCAL_IP}
+ Forwards    : 80/tcp, 443/tcp, 443/udp
+ UFW status  : active (run 'ufw status verbose' for detail)
+ NAT rules   : /etc/ufw/before.rules  (original backed up to .naive-orig)
+============================================================
+
+NEXT STEPS:
+ 1. Point your domain's A-record → ${LOCAL_IP} (this forwarder's IP).
+ 2. On the origin VPS (${ORIGIN_IP}) run:
+      NODE_ROLE=standalone bash <(curl -Ls https://raw.githubusercontent.com/SNPR/naive-installer/main/deploy-naive-server.sh)
+    Origin's Let's Encrypt ACME flow will traverse THIS forwarder — no extra
+    config needed.
+ 3. Client connects to <your-domain>:443 with the origin's creds. The
+    forwarder is fully transparent: kernel-level packet rewriting, no TLS
+    termination here.
+EOF
+  exit 0
+fi
+
+# ============================================================================
+# STANDALONE role — full naive/Caddy server.
+# ============================================================================
+
 ask DOMAIN    "Domain (A-record already pointing to this server)" "" '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 ask EMAIL     "Email for Let's Encrypt"                          "" '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+
 # Ask for HTML_PATH with re-prompt on invalid input (interactive mode only).
 # Empty answer -> skip (built-in stub will be used).
 validate_html_path() {
@@ -164,53 +314,6 @@ if [[ -z "${MASK_SITE:-}" ]]; then
 fi
 
 ask_yn ENABLE_WARP "Route outbound traffic through Cloudflare WARP (hides VPS IP)?" n
-
-# Node role: standalone | entry | exit. Only "entry" has extra config.
-NODE_ROLE="${NODE_ROLE:-}"
-case "$NODE_ROLE" in
-  standalone|entry|exit) ;;
-  "")
-    if [[ "${NONINTERACTIVE:-0}" != "1" && -t 0 ]]; then
-      printf '\n\033[1;34m=== Node role ===\033[0m\n'
-      printf '  1) standalone — single naive server (most common)\n'
-      printf '  2) entry      — forwards client CONNECTs to another naive (exit) node\n'
-      printf '  3) exit       — like standalone, but will receive chained traffic from an entry node\n'
-      role_reply=""
-      read -rp "$(printf '\033[1;36m?\033[0m Choose [1]: ')" role_reply
-      case "${role_reply:-1}" in
-        2|entry) NODE_ROLE=entry ;;
-        3|exit)  NODE_ROLE=exit ;;
-        *)       NODE_ROLE=standalone ;;
-      esac
-    else
-      NODE_ROLE=standalone
-    fi
-    ;;
-  *) die "NODE_ROLE must be one of: standalone, entry, exit (got: $NODE_ROLE)" ;;
-esac
-
-# Entry role needs the exit node's credentials.
-if [[ "$NODE_ROLE" == "entry" ]]; then
-  ask UPSTREAM_DOMAIN "Exit node domain (from exit's /root/naive-credentials.txt)" "" '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-  ask UPSTREAM_USER   "Exit node username" ""
-  ask UPSTREAM_PASS   "Exit node password" ""
-  # Enforce safe URL chars so embedded creds in `upstream https://u:p@host` parse cleanly.
-  [[ "$UPSTREAM_USER" =~ ^[A-Za-z0-9._~-]+$ ]] || die "UPSTREAM_USER has URL-unsafe chars (only A-Z a-z 0-9 . _ ~ - allowed)"
-  [[ "$UPSTREAM_PASS" =~ ^[A-Za-z0-9._~-]+$ ]] || die "UPSTREAM_PASS has URL-unsafe chars (only A-Z a-z 0-9 . _ ~ - allowed)"
-fi
-
-if [[ "$NODE_ROLE" == "entry" && "${ENABLE_WARP:-0}" == "1" ]]; then
-  warn "WARP on an entry node is unusual — entry's outbound already goes to the exit node,"
-  warn "so WARP just adds a redundant hop. Continuing because you asked for it."
-fi
-
-ARCH_RAW=$(uname -m)
-case "$ARCH_RAW" in
-  x86_64)  GOARCH=amd64 ;;
-  aarch64) GOARCH=arm64 ;;
-  armv7l)  GOARCH=armv6l ;;
-  *) die "unsupported arch: $ARCH_RAW" ;;
-esac
 
 # DNS sanity — non-fatal, just a warning.
 if command -v getent >/dev/null; then
@@ -255,15 +358,27 @@ if (( MEM_KB < 1500000 )) && [[ ! -f /swapfile ]]; then
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
-# BBR — doubles throughput on long-haul TCP; safe on all modern kernels.
+# Performance sysctls — BBR + conntrack + MTU probing + high-throughput buffers.
+# `ip_forward` is harmless on a standalone node; useful if you later convert
+# this box into a forwarder.
 if [[ "${SKIP_BBR:-0}" != "1" ]]; then
-  log "enabling BBR + fq"
-  cat > /etc/sysctl.d/99-naive-bbr.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
+  log "writing performance sysctls (BBR, conntrack, buffers)"
+  cat > /etc/sysctl.d/99-naive.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.netfilter.nf_conntrack_max = 2000000
+net.ipv4.tcp_mtu_probing = 1
+net.core.netdev_max_backlog = 250000
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
 EOF
+  # Clean up older filename from previous script versions.
+  rm -f /etc/sysctl.d/99-naive-bbr.conf
   sysctl -q --system
 fi
 
@@ -503,16 +618,6 @@ fi
 
 # ------------------------------------------------------------ caddyfile
 
-# Chain: if this is an entry node, add an HTTPS upstream pointing at the exit.
-# HTTPS upstream is handled by a dedicated HTTP-CONNECT dialer in the plugin
-# (not by proxy.FromURL), so it works reliably with h2 CONNECT — unlike the
-# SOCKS5 upstream path that got dropped in an earlier revision of this script.
-if [[ "$NODE_ROLE" == "entry" ]]; then
-  UPSTREAM_LINE="            upstream https://${UPSTREAM_USER}:${UPSTREAM_PASS}@${UPSTREAM_DOMAIN}:443"
-else
-  UPSTREAM_LINE=""
-fi
-
 # Mask site: reverse_proxy if MASK_SITE set, else serve a static site.
 if [[ -n "${MASK_SITE:-}" ]]; then
   MASK_BLOCK=$(cat <<EOF
@@ -584,7 +689,6 @@ cat > /etc/caddy/Caddyfile <<EOF
             hide_ip
             hide_via
             probe_resistance
-${UPSTREAM_LINE}
         }
 ${MASK_BLOCK}
     }
@@ -657,65 +761,33 @@ HTTP_STATUS=$(curl -sI --max-time 10 "https://${DOMAIN}/" -o /dev/null -w '%{htt
 TLS_ISSUER=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN}" 2>/dev/null \
              | openssl x509 -noout -issuer 2>/dev/null | sed 's/issuer= *//')
 
-# Entry-node end-to-end chain check: curl through our own proxy and see what
-# public IP comes out. Should NOT be this VDS's IP; should be the exit's
-# egress (exit VDS IP, or Cloudflare if the exit has WARP on).
-CHAIN_EGRESS_IP=""
-if [[ "$NODE_ROLE" == "entry" ]]; then
-  CHAIN_EGRESS_IP=$(curl -s4 --max-time 20 \
-    --proxy "https://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}:443" \
-    https://ifconfig.me 2>/dev/null || true)
-  THIS_VPS_IP=$(curl -s4 --max-time 5 https://ifconfig.me 2>/dev/null || true)
-  if [[ -z "$CHAIN_EGRESS_IP" ]]; then
-    warn "chain test failed — entry could not reach exit. Check:"
-    warn "  - exit node is reachable:   curl -I https://${UPSTREAM_DOMAIN}/"
-    warn "  - upstream creds are right: UPSTREAM_USER / UPSTREAM_PASS"
-    warn "  - exit's 443 is open in its firewall"
-  elif [[ "$CHAIN_EGRESS_IP" == "$THIS_VPS_IP" ]]; then
-    warn "chain egress equals entry VPS IP — upstream seems inactive"
-  else
-    log "chain OK — client traffic exits with IP ${CHAIN_EGRESS_IP}"
-  fi
-fi
-
 # ------------------------------------------------------------ summary
 
 umask 077
+cat > "$CREDS_FILE" <<EOF
+NaiveProxy node deployed: $(date -u +%FT%TZ)
+Role:     ${NODE_ROLE}
+Domain:   ${DOMAIN}
+Username: ${NAIVE_USER}
+Password: ${NAIVE_PASS}
+
+Client config (config.json):
 {
-  echo "NaiveProxy node deployed: $(date -u +%FT%TZ)"
-  echo "Role:     ${NODE_ROLE}"
-  echo "Domain:   ${DOMAIN}"
-  echo "Username: ${NAIVE_USER}"
-  echo "Password: ${NAIVE_PASS}"
-  if [[ "$NODE_ROLE" == "entry" ]]; then
-    echo ""
-    echo "Upstream (exit) node:"
-    echo "  Domain:   ${UPSTREAM_DOMAIN}"
-    echo "  Username: ${UPSTREAM_USER}"
-    echo "  (password not re-printed for safety)"
-  fi
-  if [[ "$NODE_ROLE" != "entry" ]]; then
-    # exit/standalone: these are the creds a downstream entry (or a direct
-    # client) will use.
-    echo ""
-    echo "For a downstream ENTRY node, pass these values:"
-    echo "  UPSTREAM_DOMAIN=${DOMAIN}"
-    echo "  UPSTREAM_USER=${NAIVE_USER}"
-    echo "  UPSTREAM_PASS=${NAIVE_PASS}"
-  fi
-  echo ""
-  echo "Client config (config.json):"
-  echo "{"
-  echo "  \"listen\": \"socks://127.0.0.1:1080\","
-  echo "  \"proxy\":  \"https://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}\""
-  echo "}"
-  echo ""
-  echo "Client URL (Nekobox/Karing/Hiddify import):"
-  echo "naive+https://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}:443"
-  echo ""
-  echo "HTTP/3 variant:"
-  echo "  \"proxy\": \"quic://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}\""
-} > "$CREDS_FILE"
+  "listen": "socks://127.0.0.1:1080",
+  "proxy":  "https://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}"
+}
+
+Client URL (Nekobox/Karing/Hiddify import):
+naive+https://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}:443
+
+HTTP/3 variant:
+  "proxy": "quic://${NAIVE_USER}:${NAIVE_PASS}@${DOMAIN}"
+
+To put a cheap "clean-IP" forwarder in front of this node on another VPS,
+run there:
+  NODE_ROLE=forwarder ORIGIN_IP=$(curl -s4 --max-time 3 https://ifconfig.me 2>/dev/null || echo "<this-vps-ip>") bash <(curl -Ls https://raw.githubusercontent.com/SNPR/naive-installer/main/deploy-naive-server.sh)
+and switch your domain's A-record to the forwarder's IP.
+EOF
 umask 022
 
 if [[ "${ENABLE_WARP:-0}" == "1" && -n "${WARP_EGRESS_IP:-}" ]]; then
@@ -724,25 +796,17 @@ else
   WARP_LINE=" WARP      : disabled (egress IP = VPS IP)"
 fi
 
-if [[ "$NODE_ROLE" == "entry" ]]; then
-  CHAIN_LINE=" Upstream  : https://${UPSTREAM_DOMAIN} (exit node)"
-  [[ -n "$CHAIN_EGRESS_IP" ]] && CHAIN_LINE+=$'\n'" Chain exit: ${CHAIN_EGRESS_IP}"
-else
-  CHAIN_LINE=""
-fi
-
 cat <<EOF
 
 ============================================================
- NaiveProxy node ready — role: ${NODE_ROLE}
+ NaiveProxy standalone node ready
 ============================================================
  Domain    : ${DOMAIN}
  User      : ${NAIVE_USER}
  Pass      : ${NAIVE_PASS}
  HTTP 443  : ${HTTP_STATUS}
  TLS cert  : ${TLS_ISSUER:-<cert not issued yet>}
-${WARP_LINE}${CHAIN_LINE:+
-$CHAIN_LINE}
+${WARP_LINE}
  Creds     : ${CREDS_FILE}
  Logs      : journalctl -u caddy -f   |   /var/log/caddy/access.log
 ============================================================

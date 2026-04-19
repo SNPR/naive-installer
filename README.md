@@ -42,7 +42,7 @@ Client URL: naive+https://USER:PASS@DOMAIN:443
 curl -x socks5h://127.0.0.1:1080 https://ifconfig.me   # должен вернуть IP Cloudflare
 ```
 
-**Хочешь двухнодовую цепочку** (entry + exit, чтобы миру был виден IP второй VDS, а не первой)? См. раздел [Двухнодовая цепочка](#двухнодовая-цепочка-entry--exit) ниже.
+**Хочешь двухнодовую схему** (чистая «российская» нода впереди, заграничная позади — чтобы клиенту светить IP первой, а наружу ходить с IP второй)? См. раздел [Двухнодовая схема (forwarder + standalone)](#двухнодовая-схема-forwarder--standalone) ниже. Промежуточная нода — голый Ubuntu с iptables NAT, ни Caddy, ни домена там не нужно.
 
 ---
 
@@ -53,7 +53,7 @@ curl -x socks5h://127.0.0.1:1080 https://ifconfig.me   # должен верну
 - Создаёт systemd-юнит, открывает 80/443 TCP + 443 UDP в UFW.
 - Включает BBR, добавляет swap если RAM < 1.5 ГБ.
 - **(опционально)** Поднимает Cloudflare WARP через `wgcf` + kernel WireGuard с policy routing: исходящий трафик идёт через Cloudflare, входящий 443 — через IP VDS.
-- **(опционально)** Поддерживает топологию из двух нод (entry + exit): клиент коннектится к entry-домену, а наружу уходит с IP exit-ноды (или Cloudflare, если на exit включён WARP).
+- **(опционально)** Режим `forwarder` — отдельная L4 iptables-нода перед standalone-сервером. Кешируется в `/etc/ufw/before.rules`, не требует Caddy/сертификата/домена.
 
 ## Без интерактива (для автоматизации)
 
@@ -71,8 +71,8 @@ DOMAIN=example.com EMAIL=you@mail.com ENABLE_WARP=1 HTML_PATH=/root/my-site \
 | `HTML_PATH` | Путь на сервере к твоему `index.html` или папке с сайтом |
 | `MASK_SITE` | URL стороннего сайта для `reverse_proxy` (альтернатива `HTML_PATH`) |
 | `ENABLE_WARP` | `1` — включить wgcf+WARP, `0` — отключить (дефолт) |
-| `NODE_ROLE` | `standalone` (дефолт), `entry` или `exit`. Для chain-топологии см. раздел ниже |
-| `UPSTREAM_DOMAIN` / `UPSTREAM_USER` / `UPSTREAM_PASS` | Координаты exit-ноды (нужны только для `NODE_ROLE=entry`) |
+| `NODE_ROLE` | `standalone` (дефолт) или `forwarder`. Для двухнодовой схемы см. раздел ниже |
+| `ORIGIN_IP` | IP standalone-сервера, на который `forwarder` будет NAT'ить трафик (нужен только для `NODE_ROLE=forwarder`) |
 | `NAIVE_USER` / `NAIVE_PASS` | Свои логин/пароль (иначе генерируются случайные) |
 | `GO_VERSION` | Версия Go (дефолт: свежая с go.dev) |
 | `SWAP_SIZE` | Размер swap если RAM мало (дефолт 2G) |
@@ -106,75 +106,73 @@ ssh root@<VDS_IP> 'REBUILD=1 bash /root/deploy-naive-server.sh'
 - NekoBox / NekoRay / Karing — обновляются сами через стор или встроенный updater.
 - Сырой бинарник `naive` — скачиваешь новый релиз с [github.com/klzgrad/naiveproxy/releases](https://github.com/klzgrad/naiveproxy/releases) раз в 4–8 недель (синхронно с релизами Chrome Stable).
 
-## Двухнодовая цепочка (entry + exit)
+## Двухнодовая схема (forwarder + standalone)
 
-Нужна если хочешь спрятать «выходной» IP за второй VDS — клиент коннектится к entry-домену, а запросы наружу уходят с IP exit-ноды. Плюсы:
+Нужна когда хочешь чтобы миру светилась «чистая» нода (например, дешёвая российская), а сам naive-сервер жил на второй VDS за ней. Клиент коннектится к домену, чей A-record указывает на forwarder; forwarder на уровне ядра NAT'ит пакеты на origin, где стоит Caddy+naive. Плюсы:
 
-- Миру светится только entry-IP. Если его забанят — меняешь только entry, exit остаётся чистым.
-- Entry можно взять поближе (низкий пинг из РФ), exit — в юрисдикции получше.
-- На exit можно включить WARP — тогда трафик миру показывается от Cloudflare, а не от VDS.
+- **Миру виден только IP forwarder'а.** Если его забанят — меняешь одну iptables-инструкцию или переезжаешь на новую дешёвую ноду, origin остаётся нетронутым.
+- **Forwarder — голый Ubuntu**, 128MB RAM хватит. Ни Caddy, ни Go, ни сертификата, ни домена на нём не нужно.
+- **Ноль TLS-in-TLS на forwarder'е** — клиент TLS-handshake'ится прямо с origin (через ядро). DPI на forwarder'е видит обычный зашифрованный TLS.
+- **WARP можно включить на origin** — тогда трафик наружу уходит с IP Cloudflare. На forwarder'е WARP бессмысленен (L4, ничего не инициирует).
 
 ### Порядок развёртывания
 
-**1. Сначала поднимаешь exit-ноду** (домен B, VDS Y):
+**1. Поменяй A-запись домена → IP forwarder'а** (ещё до установки; пока никто не ответит, это нормально).
+
+**2. На forwarder-VDS** (дешёвая RU-нода):
 
 ```bash
-scp deploy-naive-server.sh root@<EXIT_VDS_IP>:/root/
-ssh root@<EXIT_VDS_IP> 'NODE_ROLE=exit ENABLE_WARP=1 bash /root/deploy-naive-server.sh'
-# Интерактивно: домен exit-ноды, email
+NODE_ROLE=forwarder ORIGIN_IP=<IP origin-сервера> \
+  bash <(curl -Ls https://raw.githubusercontent.com/SNPR/naive-installer/main/deploy-naive-server.sh)
 ```
 
-В `/root/naive-credentials.txt` на exit найдёшь блок:
-```
-For a downstream ENTRY node, pass these values:
-  UPSTREAM_DOMAIN=exit.example.com
-  UPSTREAM_USER=<…>
-  UPSTREAM_PASS=<…>
-```
+Интерактивно спросит только ORIGIN_IP, если не передал через env. Занимает ~10 секунд: установка `ufw`, прописывание NAT-правил в `/etc/ufw/before.rules`, открытие портов 80/443 TCP + 443 UDP.
 
-**2. Потом поднимаешь entry-ноду** (домен A, VDS X), передавая exit-креды:
+**3. На origin-VDS** (заграничная нода, где будет жить сам naive):
 
 ```bash
-scp deploy-naive-server.sh root@<ENTRY_VDS_IP>:/root/
-ssh root@<ENTRY_VDS_IP> '
-  NODE_ROLE=entry \
-  UPSTREAM_DOMAIN=exit.example.com \
-  UPSTREAM_USER=<из шага 1> \
-  UPSTREAM_PASS=<из шага 1> \
-  bash /root/deploy-naive-server.sh
-'
+NODE_ROLE=standalone \
+  bash <(curl -Ls https://raw.githubusercontent.com/SNPR/naive-installer/main/deploy-naive-server.sh)
 ```
 
-На интерактивные вопросы отвечаешь:
-- **Domain** / **Email** — для entry-ноды (не для exit).
-- **HTML path** — что хочешь на заглушке entry-ноды.
-- **`Route outbound traffic through Cloudflare WARP? [y/N]`** → **n**. На entry WARP не нужен: трафик и так уходит на exit-ноду по TCP/443, а WARP на entry — просто лишний хоп. Если всё-таки ответишь `y`, скрипт это пропустит но выдаст предупреждение.
+Интерактивно домен, email, HTML, WARP. Домен — тот же, который теперь указывает на forwarder. Caddy'шный ACME-flow для Let's Encrypt пройдёт **через forwarder** (ACME-сервер разрешит домен → forwarder IP → пакеты DNAT'нутся на origin → Caddy ответит). Никакой специальной настройки для этого не нужно.
 
-В конце скрипт выполнит smoke-тест — curl через entry-прокси на `ifconfig.me`. Если вернётся IP exit (или Cloudflare при WARP на exit) — цепочка работает.
-
-**3. Клиент настраиваешь на entry-домен:**
+**4. Клиент** получает обычный URL:
 
 ```
-naive+https://ENTRY_USER:ENTRY_PASS@entry.example.com:443
+naive+https://USER:PASS@domain:443
 ```
 
-Клиент даже не знает о существовании exit — для него это обычный naive-сервер.
+Клиент думает что общается с сервером, стоящим на IP forwarder'а. На самом деле TLS-соединение терминируется на origin; forwarder лишь гонит пакеты туда-обратно.
 
-### Правила
+### Проверка после установки
 
-- **WARP ставь на exit, не на entry.** На entry он бесполезен (трафик и так идёт на exit по TCP/443).
-- **exit-сервер публичный**: entry коннектится к нему по TCP/443 как обычный клиент. Никакой особой настройки фаервола на exit не нужно.
-- **Entry использует HTTPS-upstream** (`upstream https://…` в Caddy).
-- **Если exit недоступен** — entry перестанет проксировать. Имеет смысл держать запасной exit и переключаться правкой `/etc/caddy/Caddyfile` + `systemctl reload caddy`.
-
-### Разворачивать обратно в standalone
-
+На forwarder:
 ```bash
-NODE_ROLE=standalone bash /root/deploy-naive-server.sh
-# или просто пропустить вопрос роли (дефолт = standalone)
+sysctl net.ipv4.ip_forward                   # = 1
+iptables -t nat -L PREROUTING -n -v | grep DNAT
+ufw status verbose | grep "Default:"         # FORWARD: allow
 ```
 
-Скрипт перегенерирует Caddyfile без `upstream`, и entry станет обычным naive-сервером (клиент сможет продолжать пользоваться теми же кредами).
+На origin:
+```bash
+systemctl status caddy --no-pager
+journalctl -u caddy -n 20 | grep certificate # ACME успешно обновил сертификат
+```
+
+С клиента:
+```bash
+curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
+# покажет IP origin (или Cloudflare если на origin включён WARP)
+```
+
+### Откат в одиночную ноду
+
+Просто смени A-запись с forwarder'а обратно на origin IP — и всё. На forwarder ничего удалять не обязательно, он перестанет получать трафик. Если хочешь совсем снести — `rm /etc/ufw/before.rules && mv /etc/ufw/before.rules.naive-orig /etc/ufw/before.rules && ufw reload`.
+
+### Почему именно такая модель (а не HTTPS-chain через Caddy upstream)
+
+Короткая версия: L4 forwarding даёт **меньше TLS-слоёв** (клиент делает один TLS-handshake с origin, а не два через промежуточный Caddy), **меньше ресурсов** на промежуточном VDS и **проще в эксплуатации** (нет сертификатов, нет userspace-демонов в цепочке). Подробнее в комментариях к соответствующему коммиту.
 
 ## Проверка что всё живо
 
